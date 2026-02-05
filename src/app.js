@@ -1,4 +1,4 @@
-// --- 1. THE CRYPTO FIX (MUST BE AT THE TOP) ---
+// --- 1. THE CRYPTO FIX ---
 const crypto = require('crypto');
 if (!global.crypto) {
     global.crypto = crypto;
@@ -9,7 +9,7 @@ const express = require('express');
 const { default: makeWASocket, DisconnectReason, delay } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const axios = require('axios');
-const { usePostgresAuth, initDb } = require('./db');
+const { usePostgresAuth, initDb, clearSession } = require('./db');
 
 const app = express();
 app.use(express.json());
@@ -20,39 +20,65 @@ const N8N_WEBHOOK = process.env.N8N_WEBHOOK_URL;
 
 let sock;
 let isConnected = false;
+let retryCount = 0;
+const MAX_RETRIES = 5; // Max rapid retries before we wipe data
 
 async function startWhatsApp() {
-    await initDb(); // Auto-create table
-    const { state, saveCreds } = await usePostgresAuth('main_session');
+    await initDb();
+    const { state, saveCreds, clearSession: clearDB } = await usePostgresAuth('main_session');
 
     sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        // FIX: Removed hardcoded 'version' and 'browser' to allow Baileys to auto-detect the best config.
+        connectTimeoutMs: 60000, // Give it time to connect
+        defaultQueryTimeoutMs: 60000,
+        // Removed hardcoded version/browser to let Baileys handle it
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
         
         if (connection === 'close') {
             isConnected = false;
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('❌ Connection lost. Reconnecting in 3s:', shouldReconnect);
-            
-            // FIX: Added timeout to prevent rapid reconnection loops
-            if (shouldReconnect) {
-                setTimeout(startWhatsApp, 3000);
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+            console.log(`❌ Connection closed. Status: ${statusCode}, Reconnecting: ${shouldReconnect}`);
+
+            // CASE 1: Session is invalid (Logged Out) -> Wipe DB and restart fresh
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.log("⚠️ Session invalid (Logged Out). Clearing DB and restarting...");
+                await clearDB('main_session');
+                sock = null; // Clear socket instance
+                retryCount = 0;
+                startWhatsApp(); 
+                return;
             }
+
+            // CASE 2: Rapid crash loop detection
+            if (shouldReconnect) {
+                retryCount++;
+                if (retryCount >= MAX_RETRIES) {
+                    console.log("🚨 Too many consecutive crashes! Clearing corrupted session data...");
+                    await clearDB('main_session'); // NUCLEAR OPTION: Wipe the bad data
+                    retryCount = 0;
+                    sock = null;
+                }
+                
+                // Wait 5s before retrying to stop the CPU loop
+                setTimeout(startWhatsApp, 5000); 
+            }
+
         } else if (connection === 'open') {
             isConnected = true;
+            retryCount = 0; // Reset crash counter on success
             console.log('✅ WhatsApp Connected!');
         }
     });
 
-    // Handle Incoming Messages & Statuses
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
         const msg = messages[0];
@@ -80,51 +106,53 @@ const auth = (req, res, next) => {
 
 // --- ENDPOINTS ---
 
-// FIX: New endpoint to clear bad session data
+// Manual Reset Endpoint (Just in case)
 app.get('/reset-session', async (req, res) => {
     try {
-        const { Pool } = require('pg');
-        const pool = new Pool({
-            connectionString: process.env.DATABASE_URL,
-            ssl: { rejectUnauthorized: false }
-        });
-        await pool.query('DELETE FROM wa_sessions'); // Clear the table
-        await pool.end();
-        console.log("Database cleared via reset endpoint.");
-        res.send("✅ Session cleared. The server will now likely restart or you can manually trigger a deploy.");
-        process.exit(0); // Restart server to pick up empty state
+        await clearSession('main_session');
+        if (sock) sock.end(undefined); // Kill current socket
+        res.send("✅ Session cleared. Server restarting...");
+        process.exit(0); // Force restart
     } catch (e) {
         res.status(500).send(e.message);
     }
 });
 
-// 1. Pairing
 app.post('/pair', auth, async (req, res) => {
     const { phoneNumber } = req.body;
     if (!phoneNumber) return res.status(400).json({ error: "Phone number required" });
+    
+    // Check if sock exists, if not, try to initialize it
+    if (!sock) {
+        return res.status(503).json({ error: "WhatsApp is initializing, please wait 5 seconds and try again." });
+    }
+
     try {
-        if (!sock) {
-             return res.status(503).json({ error: "WhatsApp not initialized yet" });
-        }
+        // Request code
         const code = await sock.requestPairingCode(phoneNumber.replace(/[^\d]/g, ''));
         res.json({ code });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) {
+        // If it fails, it usually means the socket is not ready. 
+        res.status(500).json({ error: "Failed to generate code. Server might be reconnecting. Wait 10s and try again." });
+    }
 });
 
-// 2. Sending Messages (Supports Replies)
+// Message sending
 app.post('/message/send', auth, async (req, res) => {
     const { to, message, quoting } = req.body;
     try {
+        if (!sock) throw new Error("WhatsApp not connected");
         const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
         await sock.sendMessage(jid, { text: message }, { quoted: quoting });
         res.json({ status: "Sent" });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 3. Media (Image/Video)
+// Media
 app.post('/message/media', auth, async (req, res) => {
     const { to, url, type, caption } = req.body;
     try {
+        if (!sock) throw new Error("WhatsApp not connected");
         const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
         const content = type === 'video' ? { video: { url }, caption } : { image: { url }, caption };
         await sock.sendMessage(jid, content);
@@ -132,33 +160,16 @@ app.post('/message/media', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 4. Reactions
-app.post('/message/react', auth, async (req, res) => {
-    const { to, messageId, emoji } = req.body;
-    try {
-        const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-        await sock.sendMessage(jid, { react: { text: emoji, key: { remoteJid: jid, fromMe: false, id: messageId } } });
-        res.json({ status: "Reacted" });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// 5. Status Updates
+// Status
 app.post('/status/post', auth, async (req, res) => {
     const { text, url, type } = req.body;
     try {
+        if (!sock) throw new Error("WhatsApp not connected");
         const content = url 
             ? (type === 'video' ? { video: { url }, caption: text } : { image: { url }, caption: text })
             : { text };
         await sock.sendMessage('status@broadcast', content);
         res.json({ status: "Status Posted" });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// 6. Group List
-app.get('/groups', auth, async (req, res) => {
-    try {
-        const groups = await sock.groupFetchAllParticipating();
-        res.json(groups);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
