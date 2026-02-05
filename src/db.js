@@ -1,12 +1,10 @@
 const { Pool } = require('pg');
 
-// Initialize Postgres Pool
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false } // Required for Supabase/Render connections
+    ssl: { rejectUnauthorized: false }
 });
 
-// 1. Auto-Create Table Function
 const initDb = async () => {
     const client = await pool.connect();
     try {
@@ -19,20 +17,17 @@ const initDb = async () => {
                 PRIMARY KEY (session_id, id)
             );
         `);
-        console.log('✅ Database table checked/created successfully.');
+        console.log('✅ Database table wa_sessions is ready.');
     } catch (err) {
-        console.error('❌ Database initialization failed:', err);
-        process.exit(1); // Stop if DB fails
+        console.error('❌ DB Initialization Error:', err);
     } finally {
         client.release();
     }
 };
 
-// 2. Session Store Logic (Baileys Adapter)
 const usePostgresAuth = async (sessionId) => {
     const { proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 
-    // Helper to read JSON
     const readData = async (id) => {
         try {
             const res = await pool.query('SELECT data FROM wa_sessions WHERE session_id = $1 AND id = $2', [sessionId, id]);
@@ -41,23 +36,18 @@ const usePostgresAuth = async (sessionId) => {
         } catch (e) { return null; }
     };
 
-    // Helper to write JSON
     const writeData = async (id, data) => {
         await pool.query(
-            `INSERT INTO wa_sessions (session_id, id, data) 
-             VALUES ($1, $2, $3) 
-             ON CONFLICT (session_id, id) 
-             DO UPDATE SET data = $3`,
+            `INSERT INTO wa_sessions (session_id, id, data) VALUES ($1, $2, $3)
+             ON CONFLICT (session_id, id) DO UPDATE SET data = $3`,
             [sessionId, id, JSON.stringify(data, BufferJSON.replacer)]
         );
     };
 
-    // Helper to delete
     const removeData = async (id) => {
         await pool.query('DELETE FROM wa_sessions WHERE session_id = $1 AND id = $2', [sessionId, id]);
     };
 
-    // Load Creds
     const creds = await readData('creds') || initAuthCreds();
 
     return {
@@ -76,23 +66,18 @@ const usePostgresAuth = async (sessionId) => {
                     return data;
                 },
                 set: async (data) => {
-                    const tasks = [];
                     for (const category in data) {
                         for (const id in data[category]) {
                             const value = data[category][id];
                             const key = `${category}-${id}`;
-                            tasks.push(value ? writeData(key, value) : removeData(key));
+                            value ? await writeData(key, value) : await removeData(key);
                         }
                     }
-                    await Promise.all(tasks);
                 }
             }
         },
-        saveCreds: async () => {
-            await writeData('creds', creds);
-        },
-        initDb // Export init function
+        saveCreds: async () => await writeData('creds', creds)
     };
 };
 
-module.exports = { usePostgresAuth, pool };
+module.exports = { usePostgresAuth, initDb };
