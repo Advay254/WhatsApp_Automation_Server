@@ -25,6 +25,15 @@ const initDb = async () => {
     }
 };
 
+const clearSession = async (sessionId) => {
+    try {
+        await pool.query('DELETE FROM wa_sessions WHERE session_id = $1', [sessionId]);
+        console.log(`🗑️ Session '${sessionId}' cleared from DB.`);
+    } catch (e) {
+        console.error('❌ Failed to clear session:', e);
+    }
+};
+
 const usePostgresAuth = async (sessionId) => {
     const { proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 
@@ -37,15 +46,23 @@ const usePostgresAuth = async (sessionId) => {
     };
 
     const writeData = async (id, data) => {
-        await pool.query(
-            `INSERT INTO wa_sessions (session_id, id, data) VALUES ($1, $2, $3)
-             ON CONFLICT (session_id, id) DO UPDATE SET data = $3`,
-            [sessionId, id, JSON.stringify(data, BufferJSON.replacer)]
-        );
+        try {
+            await pool.query(
+                `INSERT INTO wa_sessions (session_id, id, data) VALUES ($1, $2, $3)
+                 ON CONFLICT (session_id, id) DO UPDATE SET data = $3`,
+                [sessionId, id, JSON.stringify(data, BufferJSON.replacer)]
+            );
+        } catch (e) {
+            console.error(`Error writing ${id}:`, e.message);
+        }
     };
 
     const removeData = async (id) => {
-        await pool.query('DELETE FROM wa_sessions WHERE session_id = $1 AND id = $2', [sessionId, id]);
+        try {
+            await pool.query('DELETE FROM wa_sessions WHERE session_id = $1 AND id = $2', [sessionId, id]);
+        } catch (e) {
+            console.error(`Error deleting ${id}:`, e.message);
+        }
     };
 
     const creds = await readData('creds') || initAuthCreds();
@@ -76,8 +93,10 @@ const usePostgresAuth = async (sessionId) => {
                 }
             }
         },
-        saveCreds: async () => await writeData('creds', creds)
+        saveCreds: async () => await writeData('creds', creds),
+        clearSession // Exporting this so app.js can use it
     };
 };
 
-module.exports = { usePostgresAuth, initDb };
+module.exports = { usePostgresAuth, initDb, clearSession };
+            
